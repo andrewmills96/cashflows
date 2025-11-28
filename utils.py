@@ -1,83 +1,109 @@
 import numpy as np
 import pandas as pd
-import scipy as sp
+import scipy.stats as sp_stats
 import datetime
 from dataclasses import dataclass
-from typing import List, Sequence, Mapping, Optional, Union, Any
+from typing import List, Sequence, Mapping, Optional, Union, Any, Dict, Tuple
 
+# ------------------------------------------------------------------------------
+# Constants
+# ------------------------------------------------------------------------------
+DAYS_PER_YEAR = 365.0
 
-DAYS_PER_YEAR = 365
-
-def calc_dt(dates: List[datetime.datetime], val_date: datetime.datetime):
+# ------------------------------------------------------------------------------
+# Helper Functions
+# ------------------------------------------------------------------------------
+def calc_dt(dates: Union[List[datetime.datetime], pd.DatetimeIndex], val_date: datetime.datetime) -> np.ndarray:
+    """Calculates time difference in years between a list of dates and a valuation date."""
+    if isinstance(dates, list):
+        dates = pd.DatetimeIndex(dates)
+    # Ensure numpy array for slicing
     return np.array(((dates - val_date).days / DAYS_PER_YEAR))[:, None]
 
-
+# ------------------------------------------------------------------------------
+# Base Data Classes
+# ------------------------------------------------------------------------------
 class BaseDataClass:
-
+    """
+    Base class for data containers with strict schema validation.
+    """
     typeChecks = {
         'date': pd.api.types.is_datetime64_any_dtype,
         'numeric': pd.api.types.is_numeric_dtype,
         'string': pd.api.types.is_string_dtype
     }
 
-    REQUIRED_COLUMNS: dict
+    REQUIRED_COLUMNS: Dict[str, str] = {}
     data: pd.DataFrame
 
     def validate_inputs(self):
-        """confirm that the DataFrame contains exactly the correct columns"""
-
+        """Confirm that the DataFrame contains exactly the correct columns and types."""
         if not isinstance(self.data, pd.DataFrame):
             raise TypeError("Input must be a pandas DataFrame.")
 
-        # check that the dataFrame has exectly the right columns
-        req = set(self.REQUIRED_COLUMNS)
-        act = set(self.data.columns)
-
-        missing_cols = req - act
-        extra_cols = act - req
-
+        # Check required columns exist
+        missing_cols = set(self.REQUIRED_COLUMNS.keys()) - set(self.data.columns)
         if missing_cols:
-            raise ValueError(f"Missing required column(s) {missing_cols}")
-        if extra_cols:
-            raise ValueError(f"Unexpected column(s) {extra_cols}")
+            raise ValueError(f"Missing required column(s): {missing_cols}")
 
-        # check for correct types in each column
-        bad_types= []
-        for col, req in self.REQUIRED_COLUMNS.items():
-            if req is not None and not self.typeChecks[req](self.data[col]):
-                bad_types.append(f"Column {col}: {req} expected, {self.data[col].dtype} found")
+        # Check for unexpected columns (Strict Schema)
+        extra_cols = set(self.data.columns) - set(self.REQUIRED_COLUMNS.keys())
+        if extra_cols:
+            raise ValueError(f"Unexpected column(s) detected: {extra_cols}. Expected only: {list(self.REQUIRED_COLUMNS.keys())}")
+
+        # Check types
+        bad_types = []
+        for col, req_type in self.REQUIRED_COLUMNS.items():
+            if req_type is not None:
+                # If expecting date, try to convert if not already
+                if req_type == 'date' and not self.typeChecks['date'](self.data[col]):
+                    try:
+                        self.data[col] = pd.to_datetime(self.data[col], dayfirst=True)
+                    except Exception:
+                        bad_types.append(f"Column '{col}' could not be converted to datetime.")
+                        continue
+                
+                # Re-check type
+                if not self.typeChecks[req_type](self.data[col]):
+                    bad_types.append(f"Column '{col}': expected {req_type}, found {self.data[col].dtype}")
 
         if bad_types:
-            raise TypeError(f"Bad column type(s) {bad_types}")
+            raise TypeError(f"Column type mismatch: {bad_types}")
 
-
+# ------------------------------------------------------------------------------
+# Market Data Classes
+# ------------------------------------------------------------------------------
 class Rates(BaseDataClass):
     """
     Class to hold a discount rate curve.
-    Input must be a dataframe of dates and yields
-    Valuation date must be provided
-    Columns must be: date, yield
     """
-
     REQUIRED_COLUMNS = {"date": 'date', "yield": 'numeric'}
 
     def __init__(self, data: pd.DataFrame):
-        self.data = data
+        self.data = data.copy()
         self.validate_inputs()
-
+        
         # yields and fwds as a date-indexed Series
-        self.yields = data.set_index('date')['yield']
+        self.yields = self.data.set_index('date')['yield']
 
-    # Calculate implied forward rates from the specified yield curve
     def calc_fwds(self, val_date: datetime.datetime) -> pd.Series:
+        """Calculate implied forward rates from the specified yield curve."""
 
         # ensure you are only using yields after val date
         y = self.yields.loc[val_date:]
+        
+        # Explicitly cast to DatetimeIndex to satisfy static analysis
+        dates = pd.DatetimeIndex(y.index)
 
-        t = np.array((y.index - val_date).days / 365.0)
-        acc = (1 + y) ** t
-
-        # forwards calculated as the percentage change in total accumulation factors for each time index t
+        # Use global constant for consistency
+        t = np.array((dates - val_date).days / DAYS_PER_YEAR) 
+        
+        # Avoid division by zero at t=0
+        with np.errstate(divide='ignore', invalid='ignore'):
+            acc = (1 + y) ** t
+        
+        # forwards calculated as the percentage change in total accumulation factors
+        # shift() moves data down, so acc / acc.shift() is A(t) / A(t-1)
         fwds = (acc / acc.shift()) ** (1 / (t - np.roll(t, 1))) - 1
 
         # first forward set to first yield
@@ -85,11 +111,10 @@ class Rates(BaseDataClass):
         fwds.name = 'fwds'
         return fwds
 
-    # Linearly interpolates yields to the specified dates.
     def interpolate(self, dates: pd.DatetimeIndex) -> pd.Series:
-
+        """Linearly interpolates yields to the specified dates."""
         if not isinstance(dates, pd.DatetimeIndex):
-            raise TypeError("dates must be a pd.DatetimeIndex.")
+            dates = pd.DatetimeIndex(dates)
 
         # Combine and sort index
         combined_index = self.yields.index.union(dates).sort_values()
@@ -107,16 +132,14 @@ class Rates(BaseDataClass):
 class Liabilities(BaseDataClass):
     """
     Class to hold liability cashflows.
-    Input must be a dataframe of cashflows and dates
-    Columns must be: date, cashflow
     """
-
     REQUIRED_COLUMNS = {"date": 'date', "cashflow": 'numeric'}
 
     def __init__(self, data: pd.DataFrame, name='liabilities'):
         self.name = name
         self.data = data.copy()
-        self.validate_inputs()
+        # Validation will handle datetime conversion
+        self.validate_inputs() 
         self.data.set_index("date", inplace=True)
         self.cashflows = self.data["cashflow"]
 
@@ -126,15 +149,18 @@ class Liabilities(BaseDataClass):
     def to_series(self):
         return self.cashflows
 
-    def pv(self, rates: "Rates | float", val_date: datetime.datetime, shift=0.0) -> float:
+    def pv(self, rates: Union["Rates", float], val_date: datetime.datetime, shift=0.0) -> float:
         """
         Calculate PV of liabilities for a specified date and discount rate.
         """
-
         # Subset of Cashflows and dates beyond valuation date
         cashflows = self.cashflows.loc[val_date:]
-        dates = pd.to_datetime(cashflows.index, dayfirst = True)
-        t = (dates-val_date) / pd.Timedelta(days=365)
+        if cashflows.empty:
+            return 0.0
+            
+        dates = pd.DatetimeIndex(cashflows.index)
+        val_date_ts = pd.to_datetime(val_date)
+        t = (dates - val_date_ts).days / DAYS_PER_YEAR
 
         # Allow for rates to be defined as a curve (Rates) object, or a single flat rate.
         if isinstance(rates, (int, float)):
@@ -142,6 +168,7 @@ class Liabilities(BaseDataClass):
         else:
             yields_int = rates.interpolate(dates)
             net_yield = yields_int + shift
+            
         df = (1 + net_yield) ** -t
         pv = (cashflows * df).sum()
         return pv
@@ -150,12 +177,45 @@ class Liabilities(BaseDataClass):
         return str(self.data)
 
 
+class Issuers(BaseDataClass):
+    """
+    Class for holding data on bond issuers.
+    """
+    REQUIRED_COLUMNS = {"id": 'string', "sector": 'string', "rating": 'string'}
+
+    def __init__(self, data: pd.DataFrame):
+        self.data = data.copy()
+        # Ensure all required string columns are cast to string before validation
+        # This handles cases where 'sector' or 'rating' might be inferred as int/object
+        for col in ['id', 'sector', 'rating']:
+            if col in self.data.columns:
+                self.data[col] = self.data[col].astype(str)
+        
+        self.validate_inputs()
+        
+        self.n_sectors = self.data['sector'].nunique()
+        self.n_issuers = self.data['id'].nunique()
+        self.ids = np.array(self.data['id'])
+        
+        # Fast lookup for IDs
+        self.id_to_idx = {id_: i for i, id_ in enumerate(self.ids)}
+
+        # Check that ids are unique
+        if self.data['id'].duplicated().any():
+            duplicates = self.data.loc[self.data['id'].duplicated(), 'id'].unique()
+            raise KeyError(f"Duplicated IDs detected: {list(duplicates)}")
+
+    def __str__(self):
+        return str(self.data)
+
+# ------------------------------------------------------------------------------
+# Simulation Classes
+# ------------------------------------------------------------------------------
 class TransitionMatrix:
     """
     Class for holding a credit rating transition matrix.
-    Matrix must be defined as a square matrix with labels.
+    Optimized for vectorized state transitions.
     """
-
     def __init__(self, tmatrix: np.ndarray, labels: list[str]):
         if tmatrix.ndim != 2:
             raise IndexError("2-d transition matrix expected")
@@ -164,573 +224,604 @@ class TransitionMatrix:
         if len(labels) != tmatrix.shape[0]:
             raise IndexError("labels is not the same length as one side of the transition matrix")
 
+        self.labels = np.array(labels)
+        self.label_to_idx = {l: i for i, l in enumerate(labels)}
+        
         self.tmatrix = pd.DataFrame(tmatrix, index=labels, columns=labels)
-        self.labels = labels
-        self.tm = {label_: np.cumsum(tmatrix[index_, :]) for (index_, label_) in enumerate(labels)}
+        
+        # Pre-calculate cumulative sum for faster vectorized lookup
+        # Shape: (n_states, n_states)
+        self.cum_probs = np.cumsum(tmatrix, axis=1)
+        # Ensure last is 1.0 explicitly to avoid float errors
+        self.cum_probs[:, -1] = 1.0
 
-        bad_rows = [k for k,v in self.tm.items() if not np.isclose(v[-1], 1)]
+        # Validate probabilities
+        bad_rows = [labels[i] for i in range(len(labels)) if not np.isclose(self.cum_probs[i, -1], 1.0)]
         if bad_rows:
             raise ValueError(f"Transition probabilities for the following states do not sum to 1.0: {bad_rows}")
 
-    def transition(self, label: str, prob: float) -> str:
-        return self.labels[np.searchsorted(self.tm[label], prob)]
-
-    def transitionv(self, label, prob):
-        return [self.transition(label_, prob_) for (label_, prob_) in zip(label, prob)]
+    def get_next_state(self, current_idxs: np.ndarray, unif_draws: np.ndarray) -> np.ndarray:
+        """
+        Vectorized state transition.
+        Args:
+            current_idxs: (N,) int array of current rating indices
+            unif_draws: (N,) float array (0-1)
+        Returns:
+            (N,) int array of next rating indices
+        """
+        # Get thresholds for each current state: (N, n_states)
+        # Advanced indexing: selects the row from cum_probs corresponding to each current_idx
+        thresholds = self.cum_probs[current_idxs]
+        
+        # Find insertion points: (N,)
+        # argmax on boolean gives index of first True
+        return (unif_draws[:, None] < thresholds).argmax(axis=1)
 
     def __str__(self):
         return str(self.tmatrix)
 
 
-class Issuers(BaseDataClass):
-    """
-    Class for holding data on bond issuers.
-    Columns must be: id, sector, rating
-    """
-
-    REQUIRED_COLUMNS = {"id": None, "sector": None, "rating": None}
-
-    def __init__(self, data: pd.DataFrame):
-        self.data = data
-        self.validate_inputs()
-        self.n_sectors = self.data['sector'].nunique()
-        self.n_issuers = self.data['id'].nunique()
-        self.ids = np.array([str(x) for x in self.data['id']])
-
-    def validate_inputs(self):
-        super().validate_inputs()
-
-        # Also check that ids are unique
-        duplicates = set(self.data.loc[self.data['id'].duplicated(), 'id'])
-        if duplicates:
-            raise KeyError(f"Duplicated IDs detected: {duplicates}")
-
-    def __str__(self):
-        return str(self.data)
-
-
 @dataclass
 class SimulationResult:
     """Container for results of a CreditRiskModel run."""
-    E: Any
-    S: Any
-    I: Any
-    X: Any
-    pX: Any
-    transitions: Any
-    transitions_df: pd.DataFrame
+    E: np.ndarray  # Economic Factors
+    S: np.ndarray  # Sector Factors
+    I: np.ndarray  # Idiosyncratic Factors
+    X: np.ndarray  # Latent Variable
+    pX: np.ndarray # Probability Map
+    transitions: np.ndarray # (n_sim, n_years, n_issuers) Int Array of rating indices
+    rating_labels: np.ndarray # Array of label strings corresponding to indices
+    transitions_df: pd.DataFrame  # Formatted Transitions (Lazy or computed)
     n_sim: int
     n_years: int
 
 
 class CreditRiskModel:
     """
-    Class to define a simulation of the Economy and sectors for each bond issuer.
-    The output of this simulation defines the ratings migrations and point at which an issuer defaults.
+    Monte Carlo simulation of issuer credit ratings using a Gaussian Copula model.
     """
 
     def __init__(
             self,
             issuers: Issuers,
-            rho_e: int,
+            rho_e: float,
             rho_s: np.ndarray,
             transition_matrix: TransitionMatrix
     ):
-
         self.rho_e = rho_e
         self.rho_s = rho_s
         self.transition_matrix = transition_matrix
-
         self.issuers = issuers
+        
         self.n_sectors = issuers.n_sectors
         self.n_issuers = issuers.n_issuers
-        self.sector_map = np.array(issuers.data['sector'])
-        self.ratings_map = np.array(issuers.data['rating'])
+        
+        # Maps to index into sector arrays
+        self.sector_map = pd.Categorical(issuers.data['sector']).codes
+        
+        # Map initial ratings to integers
+        self.initial_rating_indices = np.array([
+            self.transition_matrix.label_to_idx[r] for r in issuers.data['rating']
+        ])
 
         if len(rho_s) < issuers.n_sectors:
             raise ValueError("One or more sectors in the Issuers object do not have a sector correlation defined.")
 
     def run(self, n_sim: int, n_years: int) -> SimulationResult:
-
+        """
+        Executes the simulation using fully vectorized numpy operations.
+        """
+        # Generate Factors: (Simulations, Years, Dimensions)
         E = np.random.normal(size=[n_sim, n_years])
         S = np.random.normal(size=[n_sim, n_years, self.n_sectors])
         I = np.random.normal(size=[n_sim, n_years, self.n_issuers])
+
+        # Broadcast Factors
         X = np.sqrt(self.rho_e) * E[:, :, np.newaxis] + \
             np.sqrt(self.rho_s[self.sector_map] - self.rho_e)[np.newaxis, np.newaxis, :] * S[:, :, self.sector_map] + \
             np.sqrt(1 - self.rho_s[self.sector_map])[np.newaxis, np.newaxis, :] * I
 
-        pX = sp.stats.norm.cdf(X)
+        # Map latent variable X to probability space [0, 1]
+        pX = sp_stats.norm.cdf(X)
 
-        transitions = []
-        for s in range(n_sim):
-            rating = self.ratings_map
-            transitions.append(np.array(
-                [rating := self.transition_matrix.transitionv(rating, pX[s, t, :]) for t in range(n_years)])
-            )
+        # Initialize Transitions Array: (n_sim, n_years, n_issuers)
+        transitions = np.zeros((n_sim, n_years, self.n_issuers), dtype=int)
+        
+        # Set Initial State (broadcasted)
+        current_ratings = np.tile(self.initial_rating_indices, (n_sim, 1))
 
-        transitions_df = (
-            pd.concat(
-                pd.DataFrame(t)
-                .assign(scenario=s)
-                .reset_index(names='year')
-                for s, t in enumerate(transitions)
+        # Time Loop
+        for t in range(n_years):
+            # pX slice for this year: (n_sim, n_issuers)
+            draws = pX[:, t, :]
+            
+            # Vectorized update: flatten to (N,) for the helper, then reshape back
+            shape = current_ratings.shape # (n_sim, n_issuers)
+            
+            next_r = self.transition_matrix.get_next_state(
+                current_ratings.ravel(), 
+                draws.ravel()
             )
-            .set_axis(['year'] + list(self.issuers.ids) + ['scenario'], axis=1)
-            .melt(id_vars=['scenario', 'year'], var_name='issuer_id', value_name='rating')
+            
+            current_ratings = next_r.reshape(shape)
+            transitions[:, t, :] = current_ratings
+
+        # Create DataFrame for backward compatibility / inspection
+        # This is the slowest part, can be skipped if not plotting
+        # Flatten transitions to (Total_Steps, I)
+        flat_transitions = transitions.reshape(-1, self.n_issuers)
+        # Map indices to labels
+        flat_labels = self.transition_matrix.labels[flat_transitions]
+        
+        df = pd.DataFrame(flat_labels, columns=self.issuers.ids)
+        # Add index columns
+        # Repeat year sequence n_sim times
+        df['year'] = np.tile(np.arange(n_years), n_sim)
+        # Repeat scenario index, each repeated n_years times
+        df['scenario'] = np.repeat(np.arange(n_sim), n_years)
+        
+        transitions_df = df.melt(id_vars=['scenario', 'year'], var_name='issuer_id', value_name='rating')
+
+        return SimulationResult(
+            E=E, S=S, I=I, X=X, pX=pX, 
+            transitions=transitions,
+            rating_labels=self.transition_matrix.labels,
+            transitions_df=transitions_df, 
+            n_sim=n_sim, n_years=n_years
         )
 
-        return SimulationResult(E=E, S=S, I=I, X=X, pX=pX, transitions=transitions, transitions_df=transitions_df, n_sim=n_sim, n_years=n_years)
-
-
+# ------------------------------------------------------------------------------
+# Asset Classes
+# ------------------------------------------------------------------------------
 class Asset(BaseDataClass):
-    """
-    Base class for an asset object.
-    """
+    """Base class for an asset object."""
     def __init__(self, data):
         self.data = data
 
-    def pv(self):
-        pass
-
-    def pv_timeline(self):
-        pass
-
-    def cashflow_timeline(self):
-        pass
-
+    def run_sim(self, allocation, val_date, rates, spread_map, sim_results):
+        raise NotImplementedError
+    
+    def run_sim_arrays(self, allocation, val_date, rates, spread_map, sim_results) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        raise NotImplementedError
 
 class Bonds(Asset):
     """
     Class for holding data on bonds in a portfolio.
-    Contains three elements:
-    - data: a dataframe containing details for each bond. columns are: id, issuer_id, notional, recovery
-    - cashflows: a cashflows table with dates as the index and bond ids as the columns
-    - issuers: details of the bond issuers including sector and rating
+    Optimized to work with integer rating indices.
     """
-
     REQUIRED_COLUMNS = {'id': 'string' ,'issuer_id' : 'string', 'notional': 'numeric', 'recovery': 'numeric'}
 
     def __init__(self, data: pd.DataFrame, cashflow_table: pd.DataFrame, issuers: Issuers):
-        self.data = data
-        self.cashflow_table = cashflow_table.set_index('date')
+        self.data = data.copy()
+        self.data['id'] = self.data['id'].astype(str)
+        self.data['issuer_id'] = self.data['issuer_id'].astype(str)
+        
+        self.cashflow_table = cashflow_table.copy()
+        if 'date' in self.cashflow_table.columns:
+             self.cashflow_table['date'] = pd.to_datetime(self.cashflow_table['date'], dayfirst=True)
+        self.cashflow_table.set_index('date', inplace=True)
+        
         self.issuers = issuers
         self.validate_inputs()
 
         # Gather data for the bonds
-        self.ids = np.array([str(x) for x in self.data['id']])
+        self.ids = np.array(self.data['id'])
         self.issuer_map = np.array(self.data['issuer_id'])
         self.notional_map = np.array(self.data['notional'])
         self.recovery_map = np.array(self.data['recovery'])
         self.n_bonds = len(self.data)
+        
+        # Pre-map bonds to issuer indices for fast lookup in simulation results
+        self.bond_issuer_indices = np.array([self.issuers.id_to_idx[iid] for iid in self.issuer_map])
 
     def validate_inputs(self):
         super().validate_inputs()
-
-        # check that the columns for the cashflow table are included in data map
+        # Verify integrity
         cf_table_ids = set(self.cashflow_table.columns)
         bond_data_ids = set(self.data['id'])
-
-        missing = cf_table_ids - bond_data_ids
-        extra = bond_data_ids - cf_table_ids
-        if missing:
-            raise KeyError(f"Bond mapping data missing for bond ids: {missing}")
-        if extra:
-            raise KeyError(f"Cashflows missing for bond ids: {extra}")
-
-        # check that there is information for all issuers in the issuer object
-        bond_issuers = set([str(x) for x in self.data['issuer_id']])
+        if cf_table_ids != bond_data_ids:
+            raise KeyError("Mismatch between Bond Data and Cashflows.")
+        
+        # Verify issuers exist
+        bond_issuers = set(self.data['issuer_id'])
         issuer_ids = set(self.issuers.ids)
-
         missing_issuers = bond_issuers - issuer_ids
-
         if missing_issuers:
-            raise KeyError(f"Issuer information missing for the follwing issuer ids: {missing_issuers}")
+            raise KeyError(f"Bond issuers not found in Issuers object: {missing_issuers}")
 
-    def pv(self, val_date: datetime.datetime, rates: Rates, spread_map: dict):
-        """
-        Calculates the PV of the cashflows for a given set of rates and spread at a valuation date.
-        This PV is based only on the cashflows and does not account for the allocation to this bond object.
-        """
-        # Only consider cashflows beyond val_date
+    def _get_spread_table(self, spread_map: dict, rating_labels: np.ndarray) -> np.ndarray:
+        """Creates a lookup array where index=rating_int, value=spread."""
+        arr = np.zeros(len(rating_labels))
+        for i, label in enumerate(rating_labels):
+            arr[i] = spread_map.get(label, 0.0)
+        return arr
+
+    def _get_default_index(self, rating_labels: np.ndarray) -> int:
+        """Finds integer index for 'Default' state."""
+        # Assuming label is "Default"
+        matches = np.where(rating_labels == "Default")[0]
+        if len(matches) > 0:
+            return matches[0]
+        return -1 # Should not happen if Default is in matrix
+
+    def pv(self, val_date: datetime.datetime, rates: Rates, spread_map: dict) -> float:
         cfs_future = self.cashflow_table.loc[self.cashflow_table.index >= val_date]
         if cfs_future.empty:
             return 0.0
 
-        dates = cfs_future.index
+        # Explicitly cast to DatetimeIndex to resolve Pylance ambiguity
+        dates = pd.DatetimeIndex(cfs_future.index)
         cashflows = cfs_future.to_numpy()
 
-        # Get risk free discount rates for target dates
         yields = rates.interpolate(dates).to_numpy()[:, None]
 
-        # Get spreads based on issuer ratings
-        merged = self.data.merge(self.issuers.data[['id', 'rating']], how = 'left', left_on = 'issuer_id', right_on = 'id')
+        # Standard Pandas Merge for single point calculation is fine
+        merged = self.data.merge(self.issuers.data[['id', 'rating']], how='left', left_on='issuer_id', right_on='id')
         spreads = merged["rating"].map(spread_map).to_numpy()
 
-        # Broadcast to same shape as cashflows
         yields_mat = np.broadcast_to(yields, cashflows.shape)
         spreads_mat = np.broadcast_to(spreads, cashflows.shape)
 
-        # Compute discount factors
-        # dt = np.array(((dates - val_date).days / 365))[:, None]
         dt = calc_dt(dates, val_date)
         dfs = (1 + yields_mat + spreads_mat) ** (-dt)
 
-        # Calc PV
-        pv = np.sum(cashflows * dfs)
+        return np.sum(cashflows * dfs)
 
-        return pv
-
-    def expected_cashflows(self, allocation: float, val_date: datetime.datetime, rates: Rates, spread_map: dict):
-        # Adjust cashflows according to allocation
-        raw_pv = self.pv(val_date, rates, spread_map)
-        ratio = allocation / raw_pv
-        cashflows_adj = self.cashflow_table.loc[val_date:] * ratio
-        return cashflows_adj
-
-    def sim_pv(self, allocation: float, val_date: datetime.datetime, rates: Rates, spread_map: dict, sim_results: SimulationResult):
+    def sim_pv(self, allocation: float, val_date: datetime.datetime, rates: Rates, spread_map: dict, sim_results: SimulationResult) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Calculates the PV timeline for all bonds in the object for a given transitions simulation.
+        Calculates PV timeline. Returns raw arrays (pv, dates) for efficiency.
         """
-        # Adjust cashflows according to allocation
         raw_pv = self.pv(val_date, rates, spread_map)
-        ratio = allocation / raw_pv
+        ratio = allocation / raw_pv if raw_pv != 0 else 0
+        cashflows_adj = self.cashflow_table.loc[val_date:] * ratio
+        
+        cashflows_np = cashflows_adj.to_numpy()
+        
+        # Explicitly cast to DatetimeIndex to resolve Pylance ambiguity
+        dates = pd.DatetimeIndex(cashflows_adj.index)
+        
+        n_years_cf = len(dates)
+        n_sim = sim_results.n_sim
+        n_bonds = self.n_bonds
+
+        # 1. Get Integer Ratings for Bonds (S, T, B)
+        # Using pre-calculated issuer indices to slice the 3D transitions array
+        bond_ratings = sim_results.transitions[:, :n_years_cf, self.bond_issuer_indices]
+
+        # 2. Map Ratings to Spreads using NumPy lookup (S, T, B)
+        spread_table = self._get_spread_table(spread_map, sim_results.rating_labels)
+        spreads_3d = spread_table[bond_ratings]
+
+        # 3. Rates
+        yields = rates.interpolate(dates).to_numpy()
+        dt = ((dates - val_date).days / DAYS_PER_YEAR).to_numpy()
+
+        # 4. Vectorized Discounting
+        pvs = np.zeros((n_sim, n_years_cf, n_bonds))
+        
+        for t in range(n_years_cf - 1):
+            future_cfs = cashflows_np[t+1:] # (Remaining, B)
+            delta_t = (dt[t+1:] - dt[t])[:, None] # (Remaining, 1)
+            
+            # Spread at time t applies to future
+            spread_at_t = spreads_3d[:, t, :] # (S, B)
+            yields_future = yields[t+1:][:, None] # (Remaining, 1)
+            
+            # (1, Rem, 1) + (S, 1, B) -> (S, Rem, B)
+            total_rate = yields_future[None, :, :] + spread_at_t[:, None, :]
+            
+            dfs = (1 + total_rate) ** -delta_t[None, :, :]
+            term_pvs = future_cfs[None, :, :] * dfs
+            pvs[:, t, :] = term_pvs.sum(axis=1)
+
+        # 5. Default Logic
+        default_idx = self._get_default_index(sim_results.rating_labels)
+        if default_idx != -1:
+            is_default = (bond_ratings == default_idx)
+            pvs *= (~is_default)
+
+        return pvs, dates.to_numpy()
+
+    def sim_cashflows(self, allocation: float, val_date: datetime.datetime, rates: Rates, spread_map: dict, sim_results: SimulationResult) -> np.ndarray:
+        """Returns raw cashflow array (S, T, B)."""
+        raw_pv = self.pv(val_date, rates, spread_map)
+        ratio = allocation / raw_pv if raw_pv != 0 else 0
         cashflows_adj = self.cashflow_table.loc[val_date:] * ratio
 
-        # Convert to arrays
         cashflows = cashflows_adj.to_numpy()
-        dates = cashflows_adj.index
-        n_years = len(dates)
+        n_years = len(cashflows)
+        n_sim = sim_results.n_sim
 
-        # Get simulated transitions
-        transitions_df = sim_results.transitions_df.copy()
+        # Get Ratings (S, T, B)
+        bond_ratings = sim_results.transitions[:, :n_years, self.bond_issuer_indices]
 
-        # Check there's enough years in sim for bond cashflows
-        assert n_years <= sim_results.n_years, "Simulation doesn't contain enough years for all bonds."
-
-        # filter and pivot transitions and map to issuers for selected bonds
-        transitions_wide = (
-            transitions_df.query("year < @n_years")
-            .pivot(index=["scenario", "year"], columns="issuer_id", values="rating")
-            .loc[:, self.issuer_map]
-        )
-
-        # Map ratings to spreads
-        spreads = transitions_wide.map(lambda r: spread_map.get(r, 0.0))
-
-        # get discount rates for dates and calculate time differences from val_date
-        yields = rates.interpolate(dates).to_numpy()[:, None]
-        dt = ((dates - val_date).days / DAYS_PER_YEAR).to_numpy()[:, None]
-
-        # calculate pv of each bond at each timestep in the simulation as the discounted sum of expected future cashflows
-        pvs = []
-        for s in range(sim_results.n_sim):
-            transition_s = transitions_wide.xs(s, level="scenario").to_numpy()
-            spread_s = spreads.xs(s, level="scenario").to_numpy()
-
-            # PV timeline
-            pv_timeline = np.empty_like(cashflows)
-            for t in range(len(dt)):
-                df = (1 + yields[t+1:] + spread_s[t]) ** (-(dt[t+1:] - dt[t]))
-                pv_timeline[t] = (cashflows[t+1:] * df).sum(axis=0)
-
-            # Zero out defaulted bonds
-            pv_timeline *= (transition_s != "Default")
-
-            pvs.append(pv_timeline)
-
-        results = (
-            pd.DataFrame(
-                {"pv": np.array(pvs).reshape(-1)},
-                index=pd.MultiIndex.from_product(
-                    [range(sim_results.n_sim), cashflows_adj.index, self.ids],
-                    names=["scenario", "date", "bond_id"],
-                ),
-            )
-            .reset_index()
-        )
-
-        return results
-
-    def sim_cashflows(self, allocation: float, val_date: datetime.datetime, rates: Rates, spread_map: dict, sim_results: SimulationResult):
-        """
-        Calculates the Simulated cashflows for all bonds in the object for a given transitions simulation.
-        """
-
-        # Adjust cashflows according to allocation
-        raw_pv = self.pv(val_date, rates, spread_map)
-        ratio = allocation / raw_pv
-        cashflows_adj = self.cashflow_table.loc[val_date:] * ratio
-
-        # Convert to arrays
-        cashflows = cashflows_adj.to_numpy()
-        dates = cashflows_adj.index
-        n_years = len(dates)
-
-        # Get simulated transitions
-        transitions_df = sim_results.transitions_df.copy()
-
-        # Check there's enough years in sim for bond cashflows
-        assert n_years <= sim_results.n_years, "Simulation doesn't contain enough years for all bonds."
-
-        # filter and pivot transitions and map to issuers for selected bonds
-        transitions_wide = (
-            transitions_df.query("year < @n_years")
-            .pivot(index=["scenario", "year"], columns="issuer_id", values="rating")
-            .loc[:, self.issuer_map]
-        )
-
-        # identify years in which we expect bonds to still be active
+        # Active logic
         years = np.arange(n_years)[:, None]
         maturity_idx = n_years - np.argmax((cashflows != 0)[::-1, :], axis=0)
-        active = (years < maturity_idx).astype(int)
+        active_mask = (years < maturity_idx).astype(int)
 
-        # Calculate the expected recovery flows that will be received in the event a bond defaults. will be 0 if bond has matured
-        recovery_flows = self.recovery_map * self.notional_map * active * ratio
+        # Recovery
+        recovery_val = self.recovery_map * self.notional_map * ratio
+        
+        # Default
+        default_idx = self._get_default_index(sim_results.rating_labels)
+        
+        if default_idx != -1:
+            is_default = (bond_ratings == default_idx).astype(int)
+            # First default logic: (S, T, B)
+            default_cumsum = np.cumsum(is_default, axis=1)
+            first_default_mask = (is_default == 1) & (default_cumsum == 1)
+            not_defaulted_mask = (default_cumsum == 0)
+        else:
+            first_default_mask = np.zeros_like(bond_ratings)
+            not_defaulted_mask = np.ones_like(bond_ratings)
 
-        # Identify the default year for each bond in each scenario and reshape into a (n_sim x n_year x n_bond) array.
-        defaulted = (transitions_wide == "Default").astype(int)
-        first_default = defaulted.groupby(level="scenario").cumsum().eq(1)
-        first_default_arr = np.array([first_default.xs(i, level='scenario').values for i in range(sim_results.n_sim)])
+        # Calc Flows
+        regular_flows = cashflows[None, :, :] * not_defaulted_mask
+        recovery_flows = recovery_val[None, None, :] * first_default_mask * active_mask[None, :, :]
+        
+        return regular_flows + recovery_flows
 
-        # Identify the years in which a bonds is still active (hasn't defaulted) and reshape into a (n_sim x n_year x n_bond) array.
-        not_defaulted = (transitions_wide != "Default").astype(int)
-        not_defaulted_arr = np.array([not_defaulted.xs(i, level='scenario').values for i in range(sim_results.n_sim)])
-
-        # Calculate total cashflows as teh expected cashflows from non-defaulted bonds plus recovery flows from defaulted bonds
-        total_cashflows = cashflows * not_defaulted_arr + recovery_flows * first_default_arr
-
-        # Convert to dataframe to return
+    def run_sim(self, allocation: float, val_date: datetime.datetime, rates: Rates, spread_map: dict, sim_results: SimulationResult):
+        """
+        Legacy wrapper. Computes PVS/CFS, returns DataFrame for Portfolio aggregation.
+        """
+        pvs, dates = self.sim_pv(allocation, val_date, rates, spread_map, sim_results)
+        cfs = self.sim_cashflows(allocation, val_date, rates, spread_map, sim_results)
+        
+        n_sim = sim_results.n_sim
+        
+        # Create output dataframe structure matching expected API
+        # Flattening arrays (S, T, B) -> (S*T*B)
+        
+        # To avoid massive DF creation inside loop, we construct it once here
         results = pd.DataFrame(
             {
-                "cashflow": total_cashflows.reshape(-1),
+                "cashflow": cfs.reshape(-1),
+                "pv": pvs.reshape(-1)
             },
             index=pd.MultiIndex.from_product(
-                [range(sim_results.n_sim), dates, self.ids],
+                [range(n_sim), dates.tolist(), self.ids.tolist()],
                 names=["scenario", "date", "bond_id"]
             )
         ).reset_index()
-
-        return results
-
-    def run_sim(self,allocation: float, val_date: datetime.datetime, rates: Rates, spread_map: dict, sim_results: SimulationResult):
-
-        # pvs
-        pvs = self.sim_pv(
-            allocation=allocation,
-            val_date=val_date,
-            rates=rates,
-            spread_map=spread_map,
-            sim_results=sim_results
-        )
-
-        # cashflows
-        cashflows = self.sim_cashflows(
-            allocation=allocation,
-            val_date=val_date,
-            rates=rates,
-            spread_map=spread_map,
-            sim_results=sim_results
-        )
-
-        # merge
-        combined = pd.merge(cashflows, pvs, how = 'outer')
-
-        # sum over all bond ids
-        aggregated = combined.groupby(['scenario', 'date']).sum().reset_index().drop(columns='bond_id')
-
+        
+        # Aggregate to Scenario-Date level immediately to save memory
+        aggregated = results.groupby(['scenario', 'date'])[['cashflow', 'pv']].sum().reset_index()
         return aggregated
+    
+    def run_sim_arrays(self, allocation: float, val_date: datetime.datetime, rates: Rates, spread_map: dict, sim_results: SimulationResult):
+        """
+        Fast path: returns aggregated numpy arrays (S, T) for cashflow and PV.
+        """
+        pvs, dates = self.sim_pv(allocation, val_date, rates, spread_map, sim_results)
+        cfs = self.sim_cashflows(allocation, val_date, rates, spread_map, sim_results)
+        
+        # Sum over bonds (axis 2) -> (S, T)
+        total_pvs = pvs.sum(axis=2)
+        total_cfs = cfs.sum(axis=2)
+        
+        return total_cfs, total_pvs, dates
 
 
 class Portfolio:
-    """
-    Class to hold a portfolio of assets. Objects must inherit from Asset class.
-    """
+    """Class to hold a portfolio of assets."""
     def __init__(self, asset_list: List[Asset], allocations: List[float]):
         self.assets = asset_list
         self.allocations = allocations
         self.total_allocation = np.sum(self.allocations)
 
     def run_sim(self, val_date: datetime.datetime, rates: Rates, spread_map: dict, sim_results: SimulationResult):
-
-        # Simulate cashflows and pvs for each asset
+        # Legacy DF output
         sims = [
             asset.run_sim(allocation, val_date, rates, spread_map, sim_results)
             for asset, allocation in zip(self.assets, self.allocations)
         ]
-
-        # Combine and sum
         combined = pd.concat(sims).groupby(['date', 'scenario']).sum().reset_index()
-
         return combined
 
+    def run_sim_arrays(self, val_date: datetime.datetime, rates: Rates, spread_map: dict, sim_results: SimulationResult) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Aggregates arrays from all assets."""
+        total_cf = None
+        total_pv = None
+        dates = None
+        
+        for asset, allocation in zip(self.assets, self.allocations):
+            if hasattr(asset, 'run_sim_arrays'):
+                cf, pv, d = asset.run_sim_arrays(allocation, val_date, rates, spread_map, sim_results)
+                
+                if total_cf is None:
+                    total_cf = cf
+                    total_pv = pv
+                    dates = d
+                else:
+                    total_cf += cf
+                    total_pv += pv
+            else:
+                raise NotImplementedError("Asset does not support fast array simulation")
+        
+        if total_cf is None or total_pv is None or dates is None:
+             raise ValueError("Portfolio yielded no results (possibly empty).")
+             
+        return total_cf, total_pv, dates
 
+# ------------------------------------------------------------------------------
+# Mandate Classes
+# ------------------------------------------------------------------------------
 @dataclass
 class CDISimulationResult:
-    """Container for CDI simulation outputs."""
     cdi_results: pd.DataFrame
     bond_results: pd.DataFrame
     expected_pv_payment: float
 
-
 class CDIMandate:
-    """
-    Base class to hold information for CDI Mandates.
-    """
-
     def __init__(self, liabilities: Liabilities, portfolio: Portfolio, cash: float):
         self.liabilities = liabilities
-        self.assets = portfolio
+        self.portfolio = portfolio
         self.cash = cash
 
     def run(self, val_date: datetime.datetime, rates: Rates, spread_map: dict, sim_results: SimulationResult):
         pass
 
-
 class CDIMandate_Fox(CDIMandate):
-    """
-    Class for the Fox CDI mandate.
-    """
-
     def __init__(
         self, liabilities: Liabilities, portfolio: Portfolio, cash: float,
-        asset_buffer: np.ndarray, gaap_int: float, mortality_buffer: float
+        asset_buffer: np.ndarray, gaap_int: float, mortality_buffer: float,
+        special_payment_year: int = 10
     ):
-
-        self.liabilities = liabilities
-        self.portfolio = portfolio
-        self.cash = cash
-
-        # Fox specific parameters
+        super().__init__(liabilities, portfolio, cash)
         self.asset_buffer = asset_buffer
         self.gaap_int = gaap_int
         self.mortality_buffer = mortality_buffer
+        self.special_payment_year = special_payment_year
 
     def _payment_expected_value(self, cdi_results: pd.DataFrame, val_date: datetime.datetime, rates: Rates):
-
-        # Take a copy of results
         df = cdi_results.copy()
-
-        # Discount Rates
-        df['t'] = calc_dt(pd.Index(df['date']), val_date)
+        dates_idx = pd.DatetimeIndex(pd.to_datetime(df['date']))
+        df['t'] = calc_dt(dates_idx, val_date)
         yields = rates.yields.to_frame(name='yield')
-        merged = df.merge(yields, how='left', left_on='date', right_index=True).set_index('date')
-        merged['payment_pv']=merged['payment']*(1+merged['yield'])**(-merged['t'])
-        payments = merged.groupby(['scenario']).sum()['payment_pv']
-        expected_value = payments.mean()
-        return expected_value
+        merged = df.merge(yields, how='left', left_on='date', right_index=True)
+        
+        merged['payment_pv'] = merged['payment'] * (1 + merged['yield'])**(-merged['t'])
+        payments = merged.groupby(['scenario'])['payment_pv'].sum()
+        return payments.mean()
 
-    def run(self, val_date: datetime.datetime, rates: Rates, spread_map: dict, sim_results: SimulationResult):
-
-        # Base Date Calcs. Liabilities are valued at the GAAP interest, not discount rate
+    def run(self, val_date: datetime.datetime, rates: Rates, spread_map: dict, sim_results: SimulationResult) -> CDISimulationResult:
+        
+        # 1. Base Calcs
         L0_gaap = self.liabilities.pv(rates=self.gaap_int, val_date=val_date)
-        mortality_risk = self.mortality_buffer / L0_gaap
+        mortality_risk = self.mortality_buffer / L0_gaap if L0_gaap != 0 else 0
         day_0_hgb_gap = (L0_gaap + self.mortality_buffer) - (self.cash + self.portfolio.total_allocation + self.asset_buffer[0])
 
-        # Liability Cashflows & Dates
+        # 2. Liability Prep
         liability_cashflows = self.liabilities.cashflows.loc[val_date:]
-        dates = liability_cashflows.index
-        dt = (dates - val_date).days / 365
-        T = len(liability_cashflows.index)
+        dates = pd.DatetimeIndex(liability_cashflows.index)
+        T = len(dates)
+        val_date_ts = pd.to_datetime(val_date)
+        dt = ((dates - val_date_ts).days / DAYS_PER_YEAR).to_numpy()
 
-        # Liability PVs
-        liability_pvs = np.array([
-            (liability_cashflows.iloc[i+1:] * (1 + self.gaap_int) ** -(dt[i+1:] - dt[i])).sum()
-            for i in range(T)
-        ])
+        liability_pvs = np.zeros(T)
+        liab_cf_np = liability_cashflows.to_numpy()
+        
+        for i in range(T):
+            if i < T - 1:
+                t_delta = dt[i+1:] - dt[i]
+                df = (1 + self.gaap_int) ** -t_delta
+                liability_pvs[i] = np.sum(liab_cf_np[i+1:] * df)
 
-        # Meltdown Liabilities
         cumulative_cf = liability_cashflows.cumsum()
         meltdown_liabilities = np.maximum(
             (L0_gaap - cumulative_cf) * (1 + mortality_risk) * (1 + self.gaap_int) ** dt, 0
         )
+        meltdown_liab_np = np.array(meltdown_liabilities)
 
-        # Next 2 Years of Liabilities
         next_2_liabs = (liability_cashflows.shift(-1) + liability_cashflows.shift(-2)).fillna(0)
-
-        # Asset Data
-        starting_cash = self.cash
-        bond_df = self.portfolio.run_sim(val_date, rates, spread_map, sim_results).set_index('date')
-
-        # check that the dates match
-        bond_dates = bond_df.index.unique()
-        assert bond_dates.isin(dates).all(), "There is a mismatch between bond and liability dates. Review bond cashflows dates."
-        Tb = len(bond_dates)
-
-        # Forward rates
-        fwds = rates.calc_fwds(val_date).to_numpy()
-
-        # Convert liability Series to numpy arrays
-        liability_cf_np = liability_cashflows.to_numpy()
-        meltdown_liab_np = meltdown_liabilities.to_numpy()
         next_2_liabs_np = next_2_liabs.to_numpy()
 
-        # Run Simulation
-        results = []
-        n_sim = len(bond_df['scenario'].unique())
-        for scenario in range(n_sim):
-            # Asset cashflows and PV per scenario
-            df_scenario = bond_df[bond_df['scenario'] == scenario]
-            cashflow = df_scenario['cashflow'].to_numpy()
-            pv = df_scenario['pv'].to_numpy()
+        # 3. Asset Simulation (FAST PATH)
+        starting_cash = self.cash
+        
+        # Use optimized array return (S, T)
+        bond_cfs, bond_pvs, bond_dates = self.portfolio.run_sim_arrays(val_date, rates, spread_map, sim_results)
+        n_sim = sim_results.n_sim
 
-            # Ensure length of asset data matches liability
-            cashflow = np.pad(cashflow, (0, T - Tb))
-            pv = np.pad(pv, (0, T - Tb))
+        # Handle Mismatch in time horizons
+        # We need bond arrays to be at least T length
+        T_bonds = bond_cfs.shape[1]
+        
+        if T_bonds < T:
+            pad_width = T - T_bonds
+            # Pad axis 1 (time) with zeros at the end
+            # ((0,0) for sim axis, (0, pad_width) for time axis)
+            bond_cfs = np.pad(bond_cfs, ((0, 0), (0, pad_width)), mode='constant')
+            bond_pvs = np.pad(bond_pvs, ((0, 0), (0, pad_width)), mode='constant')
 
-            # Initialise arrays
-            cash = np.zeros(T)
-            assets = np.zeros(T)
-            meltdown_assets = np.zeros(T)
-            hgb_gap = np.zeros(T)
-            payment = np.zeros(T)
+        # 4. Vectorized Waterfall (Simulating all scenarios at once per timestep)
+        fwds = rates.calc_fwds(val_date).to_numpy()
+        
+        # State Vectors (S, T) or (S,)
+        cash_t = np.full(n_sim, starting_cash)
+        hgb_gap_t = np.full(n_sim, day_0_hgb_gap)
+        
+        # Result collectors
+        res_cash = np.zeros((n_sim, T))
+        res_assets = np.zeros((n_sim, T))
+        res_payment = np.zeros((n_sim, T))
+        
+        # Track total payment to handle "payment[:t].sum() == 0" logic
+        total_payment_so_far = np.zeros(n_sim)
 
-            # Simulation loop
-            for t in range(T):
-                prev_cash = starting_cash if t == 0 else cash[t - 1]
-                prev_gap = day_0_hgb_gap if t == 0 else hgb_gap[t - 1]
+        for t in range(T):
+            # Roll Forward
+            fwd_rate = fwds[t] if t < len(fwds) else fwds[-1]
+            
+            # (S,) = (S,) * scalar + (S,) - scalar
+            cash_t = cash_t * (1 + fwd_rate) + bond_cfs[:, t] - liab_cf_np[t]
+            
+            assets_t = cash_t + bond_pvs[:, t]
+            
+            # Buffer
+            buffer_t = self.asset_buffer[t+1] if (t+1) < len(self.asset_buffer) else 0
+            
+            meltdown_assets_t = assets_t + buffer_t
+            
+            # Gap
+            current_gap = meltdown_liab_np[t] - meltdown_assets_t
+            # clip(0, prev)
+            hgb_gap_t = np.clip(current_gap, 0, hgb_gap_t)
+            
+            # Special Payment (t specific)
+            if t == self.special_payment_year:
+                # Mask of scenarios needing payment
+                mask = assets_t < liability_pvs[t]
+                shortfall = liability_pvs[t] - assets_t
+                extra = np.minimum(shortfall, buffer_t)
+                
+                # Apply only where mask is True
+                cash_t += (extra * mask)
+                assets_t += (extra * mask)
+            
+            # Insolvency Trigger
+            # Check condition: Assets < Next2Liabs AND No prior payment
+            insolvent_mask = (assets_t < next_2_liabs_np[t]) & (total_payment_so_far == 0)
+            
+            payment_now = np.zeros(n_sim)
+            # If triggered, pay gap
+            payment_now[insolvent_mask] = hgb_gap_t[insolvent_mask]
+            
+            # Injection
+            cash_t += payment_now
+            assets_t += payment_now
+            
+            total_payment_so_far += payment_now
+            
+            # Store
+            res_cash[:, t] = cash_t
+            res_assets[:, t] = assets_t
+            res_payment[:, t] = payment_now
 
-                # Assets
-                cash[t] = prev_cash * (1 + fwds[t]) + cashflow[t] - liability_cf_np[t]
-                assets[t] = cash[t] + pv[t]
-                buffer_t = self.asset_buffer[t+1] if t < (len(self.asset_buffer)-2) else 0
+        # 5. Format Output to match legacy DataFrame structure
+        # Flatten arrays (S, T) -> S*T
+        flat_scenarios = np.repeat(np.arange(n_sim), T)
+        flat_dates = np.tile(dates, n_sim)
+        
+        # Reconstruct Bond DF for legacy result requirement
+        bond_df = pd.DataFrame({
+            'scenario': flat_scenarios,
+            'date': flat_dates,
+            'cashflow': bond_cfs[:, :T].ravel(), # Slice to T if bonds were longer
+            'pv': bond_pvs[:, :T].ravel()
+        })
 
-                meltdown_assets[t] = assets[t] + buffer_t
-                hgb_gap[t] = np.clip(meltdown_liab_np[t] - meltdown_assets[t], 0, prev_gap)
+        cdi_results = pd.DataFrame({
+            'date': flat_dates,
+            'scenario': flat_scenarios,
+            'liability_pvs': np.tile(liability_pvs, n_sim),
+            'assets': res_assets.ravel(),
+            'payment': res_payment.ravel(),
+            'cash': res_cash.ravel()
+        })
 
-                # Optional Year 11 additonal  payment if needed
-                if t == 10 and assets[t] < liability_pvs[t]:
-                    extra = min(liability_pvs[t] - assets[t], self.asset_buffer[t+1])
-                    cash[t] += extra
-                    assets[t] += extra
+        expected_pv = self._payment_expected_value(cdi_results, val_date, rates)
 
-                # Payment triggered if assets fall below next 2 liabilities
-                if assets[t] < next_2_liabs_np[t] and payment[:t].sum() == 0:
-                    payment[t] = hgb_gap[t]
-
-            # Store results
-            results.append(pd.DataFrame({
-                'date': dates,
-                'scenario': scenario,
-                'liability_cashflows': liability_cf_np,
-                'liability_pvs': liability_pvs,
-                'meltdown_liabilities': meltdown_liab_np,
-                'next_2_liabs': next_2_liabs_np,
-                'asset_cashflow': cashflow,
-                'remaining_asset_pv': pv,
-                'cash': cash,
-                'assets': assets,
-                'meltdown_assets': meltdown_assets,
-                'hgb_gap': hgb_gap,
-                'payment': payment
-            }))
-
-        # Final Output
-        cdi_results = pd.concat(results, ignore_index=True)
-
-        expected_pv_payment = self._payment_expected_value(cdi_results, val_date, rates)
-
-        return CDISimulationResult(
-            cdi_results = cdi_results,
-            bond_results = bond_df,
-            expected_pv_payment = expected_pv_payment
-        )
+        return CDISimulationResult(cdi_results, bond_df, expected_pv)
