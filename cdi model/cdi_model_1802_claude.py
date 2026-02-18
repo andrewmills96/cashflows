@@ -483,21 +483,29 @@ class Bonds:
         # For each spread value s and each valuation year t:
         #   pv_table[s_idx, t, bond] = sum_{u > t} CF[u, bond] * (1 + y_u + s)^-(dt_u - dt_t)
         #
-        # Vectorised across t using the (n_years, n_years) dtime matrix:
-        #   dtime_mat[u, t] = dt_u - dt_t  (positive = future, zero/negative = past/current)
-        dtime_mat = dt[:, np.newaxis] - dt[np.newaxis, :]                    # (n_years_cf, n_years)
-        future    = dtime_mat > 0                                             # upper-triangle mask
+        # dtime_mat[u, t] = dt_u - dt_t
+        #   rows (u): all n_years_cf cashflow dates — must NOT be truncated or PVs are wrong
+        #   cols (t): only the n_years valuation dates the simulation covers
+        #
+        # When n_years < n_years_cf (sim horizon shorter than bond maturities) these two
+        # dimensions differ, so we index dt separately for each axis.
+        dtime_mat = dt[:, np.newaxis] - dt[:n_years][np.newaxis, :]          # (n_years_cf, n_years)
+        future    = dtime_mat > 0                                             # cashflow is after val year
 
         pv_table = np.zeros((n_unique, n_years, n_bonds))
         for si, s in enumerate(unique_spreads):
-            # Discount factors for all (u, t) pairs where u > t
+            # Discount factors: shape (n_years_cf, n_years)
+            # rows = cashflow dates u, cols = valuation dates t
             dfs_mat = np.where(
                 future,
                 (1 + yields[:, np.newaxis] + s) ** (-dtime_mat),
                 0.0
             )                                                                 # (n_years_cf, n_years)
-            # pv_table[si, t, bond] = sum_u dfs_mat[u, t] * cashflows[u, bond]
-            #                       = (dfs_mat.T @ cashflows)  shape: (n_years, n_bonds)
+            # Sum over all cashflow dates u for each valuation year t:
+            #   pv_table[si, t, bond] = sum_u dfs_mat[u, t] * cashflows[u, bond]
+            #                         = (dfs_mat.T @ cashflows)
+            # dfs_mat.T: (n_years, n_years_cf)  @  cashflows: (n_years_cf, n_bonds)
+            #          = (n_years, n_bonds)  ✓
             pv_table[si] = dfs_mat.T @ cashflows                             # (n_years, n_bonds)
 
         # Map each (sim, t, bond) to its spread index then look up PV
