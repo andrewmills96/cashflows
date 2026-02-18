@@ -456,7 +456,14 @@ class Bonds:
         total_cashflows = received_cashflows + recovery_payments              # (n_sim, n_years, n_bonds)
 
         # --- Base yields and time fractions ---
-        yields = rates.interpolate(dates).values                              # (n_years_cf,)
+        # Interpolated yields may be NaN for dates outside the yield curve range.
+        # Fill forward then backward so every cashflow date has a valid rate.
+        yields = (
+            rates.interpolate(dates)
+            .ffill()
+            .bfill()
+            .values
+        )                                                                     # (n_years_cf,)
         dt     = calc_dt(dates, val_date)                                     # (n_years_cf,)
 
         # --- Present Values via PV lookup table ---
@@ -492,15 +499,19 @@ class Bonds:
         dtime_mat = dt[:, np.newaxis] - dt[:n_years][np.newaxis, :]          # (n_years_cf, n_years)
         future    = dtime_mat > 0                                             # cashflow is after val year
 
+        # Precompute (1 + y_u) for each cashflow row — shared across all spread values
+        one_plus_y = 1 + yields                                               # (n_years_cf,)
+
         pv_table = np.zeros((n_unique, n_years, n_bonds))
         for si, s in enumerate(unique_spreads):
             # Discount factors: shape (n_years_cf, n_years)
             # rows = cashflow dates u, cols = valuation dates t
-            dfs_mat = np.where(
-                future,
-                (1 + yields[:, np.newaxis] + s) ** (-dtime_mat),
-                0.0
-            )                                                                 # (n_years_cf, n_years)
+            # Avoid np.where eager evaluation of the power expression on non-future
+            # cells — if any yield is NaN those cells would propagate into the result
+            # even after masking. Instead compute only where future=True.
+            dfs_mat = np.zeros_like(dtime_mat)
+            dfs_mat[future] = (one_plus_y[:, np.newaxis] + s)[future] ** (-dtime_mat[future])
+
             # Sum over all cashflow dates u for each valuation year t:
             #   pv_table[si, t, bond] = sum_u dfs_mat[u, t] * cashflows[u, bond]
             #                         = (dfs_mat.T @ cashflows)
