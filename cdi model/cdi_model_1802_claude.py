@@ -32,6 +32,10 @@ def map_spreads(ratings: np.ndarray, spread_map: Dict[str, float]) -> np.ndarray
     Uses pd.factorize to avoid per-element Python lookups.
     ratings: any shape ndarray of rating strings.
     Returns: same shape ndarray of floats.
+
+    Any rating not found in spread_map defaults to 0.0. Any NaN values
+    in spread_map (e.g. from blank CSV cells) are also replaced with 0.0
+    and a warning is raised — NaN spreads would silently poison all PV results.
     """
     flat = ratings.ravel()
     codes, uniques = pd.factorize(flat, sort=False)
@@ -40,7 +44,21 @@ def map_spreads(ratings: np.ndarray, spread_map: Dict[str, float]) -> np.ndarray
         dtype=float,
         count=len(uniques)
     )
-    return mapped[codes].reshape(ratings.shape)
+    spreads = mapped[codes].reshape(ratings.shape)
+
+    nan_mask = np.isnan(spreads)
+    if nan_mask.any():
+        bad_ratings = np.unique(ratings.ravel()[nan_mask.ravel()])
+        warnings.warn(
+            f"NaN spread values found for rating(s): {bad_ratings.tolist()}. "
+            f"This is likely caused by blank cells in your spread CSV. "
+            f"Defaulting to 0.0 to avoid poisoning PV results.",
+            UserWarning,
+            stacklevel=2
+        )
+        spreads = np.where(nan_mask, 0.0, spreads)
+
+    return spreads
 
 
 def compute_maturity_flags(cashflows: np.ndarray) -> np.ndarray:
